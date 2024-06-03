@@ -1,0 +1,140 @@
+import re
+import sys
+import chardet
+
+def parse_fortran_code(fortran_code):
+    lines = fortran_code.split('\n')
+    parsed_lines = []
+    label_stack = []
+    continuation_line = ""
+    for line in lines:
+        stripped_line = line.strip()
+        if stripped_line.startswith(('C', 'c', '*', '!')):  # Fortran77 comments
+            continue
+        if stripped_line.endswith('&'):
+            continuation_line += stripped_line[:-1].strip() + " "
+            continue
+        if continuation_line:
+            stripped_line = continuation_line + stripped_line.strip()
+            continuation_line = ""
+        line_num = None
+        if re.match(r'^\d+', stripped_line):  # Line numbers, common in Fortran77
+            line_num = re.match(r'^\d+', stripped_line).group(0)
+            stripped_line = re.sub(r'^\d+', '', stripped_line).strip()
+        if re.match(r'GO\s+TO\s+\d+', stripped_line, re.IGNORECASE):
+            parsed_lines.append({'type': 'goto', 'label': stripped_line.split()[-1], 'line_num': line_num})
+        elif re.match(r'IF\s*\((.*?)\)\s*GO\s*TO\s*\d+', stripped_line, re.IGNORECASE):
+            condition, label = re.search(r'IF\s*\((.*?)\)\s*GO\s*TO\s*(\d+)', stripped_line, re.IGNORECASE).groups()
+            parsed_lines.append({'type': 'if_goto', 'condition': condition, 'label': label, 'line_num': line_num})
+        elif re.match(r'WHILE\s*\((.*?)\)\s*', stripped_line, re.IGNORECASE):
+            condition = re.search(r'WHILE\s*\((.*?)\)\s*', stripped_line, re.IGNORECASE).group(1)
+            parsed_lines.append({'type': 'while', 'condition': condition, 'line_num': line_num})
+        elif stripped_line.upper().startswith("ENDWHILE"):
+            parsed_lines.append({'type': 'endwhile', 'line_num': line_num})
+        elif stripped_line.upper().startswith("IF"):
+            condition_match = re.search(r'IF\s*\((.*?)\)\s*THEN', stripped_line, re.IGNORECASE)
+            if condition_match:
+                condition = condition_match.group(1)
+                parsed_lines.append({'type': 'if', 'condition': condition, 'line_num': line_num})
+        elif stripped_line.upper().startswith("ENDIF"):
+            parsed_lines.append({'type': 'endif', 'line_num': line_num})
+        elif stripped_line.upper().startswith("ELSE"):
+            parsed_lines.append({'type': 'else', 'line_num': line_num})
+        elif re.match(r'DO\s+(\d+)\s+(\w+)\s*=\s*(\d+),\s*(\d+)', stripped_line, re.IGNORECASE):
+            loop_info = re.search(r'DO\s+(\d+)\s+(\w+)\s*=\s*(\d+),\s*(\d+)', stripped_line, re.IGNORECASE)
+            if loop_info:
+                label, loop_var, loop_start, loop_end = loop_info.groups()
+                condition = f"{loop_var} <= {loop_end}"
+                parsed_lines.append({'type': 'do', 'var': loop_var, 'start': loop_start, 'end': loop_end, 'condition': condition, 'line_num': line_num, 'label': label})
+                label_stack.append(label)
+        elif stripped_line.upper() == "CONTINUE" and line_num and line_num in label_stack:
+            label = label_stack.pop()
+            parsed_lines.append({'type': 'enddo', 'line_num': line_num, 'label': label})
+        elif re.match(r'^\s*(INTEGER|REAL|DOUBLE\s+PRECISION|COMPLEX|LOGICAL|CHARACTER|INTEGER\*\d+|DIMENSION)\s+', stripped_line, re.IGNORECASE):
+            continue  # Ignore variable and dimension declarations
+        else:
+            parsed_lines.append({'type': 'statement', 'code': stripped_line, 'line_num': line_num})
+    return parsed_lines
+
+def generate_plantuml(parsed_lines):
+    plantuml_code = ['@startuml', 'start']
+    indent_level = 0
+
+    def add_indent():
+        return '    ' * indent_level
+
+    for line in parsed_lines:
+        if line['type'] == 'if':
+            plantuml_code.append(f"{add_indent()}if ({line['condition']}) then (yes)")
+            indent_level += 1
+        elif line['type'] == 'else':
+            indent_level -= 1
+            plantuml_code.append(f"{add_indent()}else (no)")
+            indent_level += 1
+        elif line['type'] == 'endif':
+            indent_level -= 1
+            plantuml_code.append(f"{add_indent()}endif")
+        elif line['type'] == 'if_goto':
+            plantuml_code.append(f"{add_indent()}if ({line['condition']}) then (yes)")
+            indent_level += 1
+            plantuml_code.append(f"{add_indent()}:go to {line['label']};")
+            plantuml_code.append(f"{add_indent()}detach")
+            indent_level -= 1
+            plantuml_code.append(f"{add_indent()}endif")
+        elif line['type'] == 'do':
+            plantuml_code.append(f"{add_indent()}while ({line['condition']}) is (yes)")
+            indent_level += 1
+            plantuml_code.append(f"{add_indent()}:initialize {line['var']} = {line['start']};")
+        elif line['type'] == 'enddo':
+            indent_level -= 1
+            plantuml_code.append(f"{add_indent()}endwhile (no)")
+        elif line['type'] == 'goto':
+            plantuml_code.append(f"{add_indent()}:go to {line['label']};")
+            plantuml_code.append(f"{add_indent()}detach")
+        elif line['type'] == 'while':
+            plantuml_code.append(f"{add_indent()}while ({line['condition']})")
+            indent_level += 1
+        elif line['type'] == 'endwhile':
+            indent_level -= 1
+            plantuml_code.append(f"{add_indent()}endwhile")
+        else:
+            if line['line_num']:
+                plantuml_code.append(f"{add_indent()}:{line['line_num']} {line['code']};")
+            else:
+                plantuml_code.append(f"{add_indent()}:{line['code']};")
+
+    plantuml_code.append('stop')
+    plantuml_code.append('@enduml')
+    return '\n'.join(plantuml_code)
+
+def main():
+    fortran_file = 'ppzsy007.for'
+    output_file = 'test.pu'
+
+    try:
+        with open(fortran_file, 'rb') as file:
+            raw_data = file.read()
+            result = chardet.detect(raw_data)
+            encoding = result['encoding']
+            fortran_code = raw_data.decode(encoding)
+    except FileNotFoundError:
+        print(f"Error: File '{fortran_file}' not found.")
+        sys.exit(1)
+    except UnicodeDecodeError:
+        print(f"Error: Cannot decode file '{fortran_file}'.")
+        sys.exit(1)
+
+    parsed_lines = parse_fortran_code(fortran_code)
+    plantuml_code = generate_plantuml(parsed_lines)
+
+    try:
+        with open(output_file, 'w', encoding='utf-8') as file:
+            file.write(plantuml_code)
+    except IOError:
+        print(f"Error: Could not write to file '{output_file}'.")
+        sys.exit(1)
+
+    print(f"PlantUML code has been written to '{output_file}'.")
+
+if __name__ == "__main__":
+    main()
